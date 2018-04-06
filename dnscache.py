@@ -45,18 +45,29 @@ class Cache:
         self.records = dict()
 
     def add(self, record: CacheRecord):
-        self.records[record.key] = record
+        if record.key not in self.records:
+            self.records[record.key] = []
+        self.records[record.key].append(record)
 
     def check_ttls(self):
-        keys_to_remove = []
         for key in self.records.keys():
-            if self.records[key].expired:
-                keys_to_remove.append(key)
-        for key in keys_to_remove:
-            self.records.pop(key)
+            new_value = []
+            for record in self.records[key]:
+                if not record.expired:
+                    new_value.append(record)
+            self.records[key] = new_value
 
-    def try_get(self, key: str):
+    def try_get(self, key: str) -> list:
         self.check_ttls()
-        if key in self.records:
-            return self.records[key].value
-        return None
+        if key not in self.records:
+            self.records[key] = []
+        return self.records[key]
+
+    def __contains__(self, item) -> bool:
+        return item in self.records and self.records[item]
+
+    def __getitem__(self, key) -> list:
+        self.check_ttls()
+        if key not in self.records:
+            self.records[key] = []
+        return self.records[key]
