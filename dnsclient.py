@@ -2,7 +2,11 @@
 import re
 import socket
 
-import dnscache
+from dnscache import *
+
+NS_RECORDS_FILE = "NS_records.json"
+AAAA_RECORDS_FILE = "AAAA_records.json"
+A_RECORDS_FILE = "A_records.json"
 
 TYPE_A = 0x0001
 TYPE_NS = 0x002
@@ -27,7 +31,7 @@ def debug(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def form_host_address_internet_question(hostname, type_, class_):
+def form_question(hostname, type_, class_):
     return encode_hostname(hostname) + \
            type_.to_bytes(2, byteorder='big') + \
            class_.to_bytes(2, byteorder='big')
@@ -53,16 +57,15 @@ def to_hex(bytes_, line_length=16):
 
 
 # noinspection SpellCheckingInspection
-def form_header(id_, qcount, ancount=0, nscount=0, arcount=0, recursive=True):
+def form_header(id_, qcount, ancount=0, nscount=0, arcount=0, recursive=True,
+                is_response=0, rcode=0000,
+                recursion_available=0):
     header = bytearray(2 * 6)
-    is_response = 0
     opcode = 0000
     is_authorative = 0
     trunc = 0
     recursion_desired = int(recursive)
-    recursion_available = 0
     z = 000
-    rcode = 0000
     info = bytearray(2)
     # числа слева от & для наглядности.
     info[0] = \
@@ -291,6 +294,12 @@ def join_rslices(sep, list_):
         yield result
 
 
+class ResponseError(ValueError):
+    def __init__(self, code, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.code = code
+
+
 class DNSClient:
     def __init__(self, print_message_contents=False, transport_protocol='udp',
                  timeout=4):
@@ -305,9 +314,7 @@ class DNSClient:
         self.print_message_contents = print_message_contents
         self.next_message_id = 1
 
-        self.ipv4_cache = dnscache.Cache()
-        self.ipv6_cache = dnscache.Cache()
-        self.ns_cache = dnscache.Cache()
+        self.load_caches()
 
     def handle_auth_records(self, message_bytes, auth_records, is_auth):
         for auth_record in auth_records:
@@ -320,7 +327,7 @@ class DNSClient:
     def handle_name_server_record(self, message_bytes, record):
         hostname = record['hostname'].lower()
         self.ns_cache[hostname] \
-            .append(dnscache.CacheRecord("NS", hostname, record['data'])
+            .append(CacheRecord("NS", hostname, record['data'])
                     .with_ttl(record["TTL"]))
 
     def handle_record(self, message, record, is_auth):
@@ -334,13 +341,13 @@ class DNSClient:
     def handle_ipv4_record(self, record, is_authoritative):
         hostname = record['hostname'].lower()
         ipv4 = get_ipv4_from_bytes(record['data'])
-        self.ipv4_cache.add(dnscache.CacheRecord("A", hostname, ipv4)
+        self.ipv4_cache.add(CacheRecord("A", hostname, ipv4)
                             .with_ttl(record['TTL']))
 
     def handle_ipv6_record(self, record, is_authoritative):
         hostname = record['hostname'].lower()
         ipv6 = get_ipv6_from_bytes(record['data'])
-        self.ipv6_cache.add(dnscache.CacheRecord("AAAA", hostname, ipv6)
+        self.ipv6_cache.add(CacheRecord("AAAA", hostname, ipv6)
                             .with_ttl(record['TTL']))
 
     def hostname_to_ip(self,
@@ -359,13 +366,20 @@ class DNSClient:
         result = dict()
         header = form_header(self.next_message_id, 1, 0, 0, 0)
         self.next_message_id += 1
-        question = form_host_address_internet_question(hostname, type_,
-                                                       CLASS_IN)
+        question = form_question(hostname, type_,
+                                 CLASS_IN)
 
-        message = self.send_and_read(dns_server_address, port,
-                                     header + question,
-                                     self.print_message_contents,
-                                     timeout=self.timeout)
+        try:
+            message = self.send_and_read(dns_server_address, port,
+                                         header + question,
+                                         self.print_message_contents,
+                                         timeout=self.timeout,
+                                         tries=1)
+        except TimeoutError:
+            result["is_auth"] = 0
+            result[hostname] = []
+            return result
+
         header_info = decode_message_header(message)
         result['is_auth'] = header_info['is_authoritative']
         response_code = header_info['rcode']
@@ -373,7 +387,7 @@ class DNSClient:
             error_message = "Unspecified error"
             if response_code in RCODE_ERROR_MESSAGES:
                 error_message = RCODE_ERROR_MESSAGES[response_code]
-            raise ValueError(error_message)
+            raise ResponseError(response_code, error_message)
         start = 12
         for _ in range(header_info['qdcount']):
             start += decode_question(message, start)[1]
@@ -385,9 +399,12 @@ class DNSClient:
                     get_ipv6_from_bytes(info['data']) if ipv6 else
                     get_ipv4_from_bytes(info['data']))
 
-        # Caching results
-        reply = decode_dns_message(message, errors='return_none')
+        self.cache_reply(message)
 
+        return result
+
+    def cache_reply(self, message):
+        reply = decode_dns_message(message, errors='return_none')
         if reply != (None,) * 5:
             is_auth = reply['header']['is_authoritative']
             for answer in reply['answers']:
@@ -397,8 +414,6 @@ class DNSClient:
 
             for additional_record in reply['additional_records']:
                 self.handle_record(reply, additional_record, is_auth)
-
-        return result
 
     def hostname_to_ns(self,
                        hostname: str,
@@ -412,13 +427,19 @@ class DNSClient:
         result = dict()
         header = form_header(self.next_message_id, 1, 0, 0, 0)
         self.next_message_id += 1
-        question = form_host_address_internet_question(hostname, TYPE_NS,
-                                                       CLASS_IN)
+        question = form_question(hostname, TYPE_NS,
+                                 CLASS_IN)
+        try:
+            message = self.send_and_read(dns_server_address, port,
+                                         header + question,
+                                         self.print_message_contents,
+                                         timeout=self.timeout,
+                                         tries=1)
+        except TimeoutError:
+            result["is_auth"] = 0
+            result[hostname] = []
+            return result
 
-        message = self.send_and_read(dns_server_address, port,
-                                     header + question,
-                                     self.print_message_contents,
-                                     timeout=self.timeout)
         header_info = decode_message_header(message)
         result['is_auth'] = header_info['is_authoritative']
         response_code = header_info['rcode']
@@ -426,20 +447,9 @@ class DNSClient:
             error_message = "Unspecified error"
             if response_code in RCODE_ERROR_MESSAGES:
                 error_message = RCODE_ERROR_MESSAGES[response_code]
-            raise ValueError(error_message)
+            raise ResponseError(response_code, error_message)
 
-        # Caching results
-        reply = decode_dns_message(message, errors='return_none')
-
-        if reply != (None,) * 5:
-            is_auth = reply['header']['is_authoritative']
-            for answer in reply['answers']:
-                self.handle_record(reply, answer, is_auth)
-            self.handle_auth_records(message, reply['authority_records'],
-                                     is_auth)
-
-            for additional_record in reply['additional_records']:
-                self.handle_record(reply, additional_record, is_auth)
+        self.cache_reply(message)
 
         result[hostname] = list(
             [record.value for record in self.ns_cache[hostname]])
@@ -451,9 +461,9 @@ class DNSClient:
         header = form_header(self.next_message_id, 1, 0, 0, 0,
                              recursive=recursive)
         self.next_message_id += 1
-        question = form_host_address_internet_question(host_to_look,
-                                                       type_,
-                                                       CLASS_IN)
+        question = form_question(host_to_look,
+                                 type_,
+                                 CLASS_IN)
 
         reply_bytes = self.send_and_read(server, port, header + question,
                                          self.print_message_contents,
@@ -512,9 +522,20 @@ class DNSClient:
                 return [record.value for record in self.ns_cache[d]]
         return None
 
+    def save_caches(self):
+        self.ipv4_cache.save_to_file(A_RECORDS_FILE)
+        self.ipv6_cache.save_to_file(AAAA_RECORDS_FILE)
+        self.ns_cache.save_to_file(NS_RECORDS_FILE)
+
+    def load_caches(self):
+        self.ipv4_cache = Cache.try_load_from_file(A_RECORDS_FILE)
+        self.ipv6_cache = Cache.try_load_from_file(AAAA_RECORDS_FILE)
+        self.ns_cache = Cache.try_load_from_file(NS_RECORDS_FILE)
+
 
 if __name__ == '__main__':
-    d = DNSClient()
-    r = d.hostname_to_ns("google.com")
-    r = d.hostname_to_ns("google.com")
-    print(r)
+    d = DNSClient(timeout=1)
+    print(d.hostname_to_ns("google.com"))
+    print(d.hostname_to_ns("microsoft.com"))
+    print(d.hostname_to_ns("urfu.ru"))
+    d.save_caches()
